@@ -1,6 +1,5 @@
 
 # Psychometric Exam Scanner App
-
 A mobile application designed to help students simulate and evaluate the Israeli psychometric exam. The app allows users to scan their completed answer sheets and automatically evaluate their test performance.
 
 ## Features
