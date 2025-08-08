@@ -52,4 +52,4 @@ A mobile application designed to help students simulate and evaluate the Israeli
 - Add user accounts to save test history
 - Provide detailed explanations for correct answers
 - Support for additional exam formats
-- Performance analytics over time
+- Performance analytics over time 
