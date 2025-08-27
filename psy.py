@@ -1,206 +1,307 @@
 import cv2
 import numpy as np
 import os
+import sys
+import json
 
-def preprocess_image(image_path):
+# Configuration
+A4_WIDTH = 3508
+A4_HEIGHT = 2480
+BUBBLE_THRESHOLD = 0.5
+QUESTION_BAR_RATIO = 0.2  # Remove top 20% for question numbers
+
+# Section coordinates (x1, y1, x2, y2)
+SECTIONS = {
+    1: (344, 608, 1861, 896),
+    2: (356, 972, 1855, 1232),
+    3: (341, 1311, 1855, 1562),
+    4: (334, 1661, 1848, 1921),
+    5: (337, 2017, 1848, 2278),
+    6: (1904, 1318, 3403, 1568),
+    7: (1889, 1664, 3427, 1931),
+    8: (1901, 2022, 3393, 2282)
+}
+
+def load_and_crop_paper(image_path):
+    """Load image and extract paper with perspective correction"""
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Could not read image from {image_path}")
-    return img
 
-def find_page_corners(img):
-    # Convert to grayscale
+    # Find paper corners
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Apply Gaussian blur
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Use Canny edge detection
     edges = cv2.Canny(blur, 50, 150)
     
-    # Dilate the edges to connect them
     kernel = np.ones((5,5), np.uint8)
     dilated = cv2.dilate(edges, kernel, iterations=1)
     
-    # Find contours
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Find the largest contour
     if not contours:
-        raise ValueError("No contours found in the image")
+        raise ValueError("No paper detected in the image")
     
-    # Sort contours by area and get the largest one
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    page_contour = contours[0]
-    
-    # Approximate the contour to get a polygon
+    page_contour = max(contours, key=cv2.contourArea)
     peri = cv2.arcLength(page_contour, True)
     approx = cv2.approxPolyDP(page_contour, 0.02 * peri, True)
     
-    # Draw the contour and corners on a copy of the image for debugging
-    debug_img = img.copy()
-    cv2.drawContours(debug_img, [page_contour], -1, (0, 255, 0), 2)
-    
-    # If we have 4 points, we have a rectangle
+    # Get 4 corners
     if len(approx) == 4:
         corners = approx.reshape(4, 2)
-        # Draw the corners
-        for corner in corners:
-            x, y = corner
-            cv2.circle(debug_img, (int(x), int(y)), 5, (0, 0, 255), -1)
-        cv2.imwrite("debug_corners.jpg", debug_img)
-        return corners
     else:
-        # If we don't have 4 points, use the bounding rectangle
         x, y, w, h = cv2.boundingRect(page_contour)
         corners = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.float32)
-        # Draw the corners
-        for corner in corners:
-            x, y = corner
-            cv2.circle(debug_img, (int(x), int(y)), 5, (0, 0, 255), -1)
-        cv2.imwrite("debug_corners.jpg", debug_img)
-        return corners
-
-def order_points(pts):
-    # Initialize a list of coordinates that will be ordered
+    
+    # Order points: top-left, top-right, bottom-right, bottom-left
     rect = np.zeros((4, 2), dtype=np.float32)
+    s = corners.sum(axis=1)
+    rect[0] = corners[np.argmin(s)]
+    rect[2] = corners[np.argmax(s)]
+    diff = np.diff(corners, axis=1)
+    rect[1] = corners[np.argmin(diff)]
+    rect[3] = corners[np.argmax(diff)]
     
-    # The top-left point will have the smallest sum
-    # The bottom-right point will have the largest sum
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    
-    # The top-right point will have the smallest difference
-    # The bottom-left will have the largest difference
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    
-    return rect
-
-def four_point_transform(image, pts):
-    # Obtain a consistent order of the points
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-    
-    # A4 dimensions at 300 DPI (landscape orientation)
-    A4_WIDTH = 3508  # Swapped with height for landscape
-    A4_HEIGHT = 2480  # Swapped with width for landscape
-    
-    # Construct set of destination points for A4 landscape size
-    dst = np.array([
-        [0, 0],
-        [A4_WIDTH - 1, 0],
-        [A4_WIDTH - 1, A4_HEIGHT - 1],
-        [0, A4_HEIGHT - 1]], dtype=np.float32)
-    
-    # Compute the perspective transform matrix and apply it
+    # Apply perspective transform
+    dst = np.array([[0, 0], [A4_WIDTH - 1, 0], [A4_WIDTH - 1, A4_HEIGHT - 1], [0, A4_HEIGHT - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (A4_WIDTH, A4_HEIGHT))
+    warped = cv2.warpPerspective(img, M, (A4_WIDTH, A4_HEIGHT))
     
     return warped
 
-def detect_answers(section_img, questions=30, choices=4):
-    # Convert to grayscale if not already
-    if len(section_img.shape) == 3:
-        gray = cv2.cvtColor(section_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = section_img
+def normalize_section(section_img, target_width=1500, target_height=300):
+    """Normalize section to consistent size"""
+    current_height, current_width = section_img.shape[:2]
     
-    # Apply thresholding
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Create white background
+    normalized = np.ones((target_height, target_width, 3), dtype=np.uint8) * 255
     
-    # Get dimensions
-    h, w = thresh.shape
+    # Scale to fit
+    scale = min(target_width / current_width, target_height / current_height)
+    new_width = int(current_width * scale)
+    new_height = int(current_height * scale)
+    resized = cv2.resize(section_img, (new_width, new_height), interpolation=cv2.INTER_AREA)
     
-    # Calculate bubble dimensions
-    bubble_w = w // questions
-    bubble_h = h // choices
+    # Center on canvas
+    y_offset = (target_height - new_height) // 2
+    x_offset = (target_width - new_width) // 2
+    normalized[y_offset:y_offset + new_height, x_offset:x_offset + new_width] = resized
     
-    answers = {}
-    for q in range(questions):
-        marked = 0
-        max_fill = 0
-        for a in range(choices):
-            # Calculate bubble coordinates
-            x1 = q * bubble_w
-            y1 = a * bubble_h
-            x2 = (q + 1) * bubble_w
-            y2 = (a + 1) * bubble_h
-            
-            # Extract bubble region
-            bubble = thresh[y1:y2, x1:x2]
-            
-            # Count filled pixels
-            fill = cv2.countNonZero(bubble)
-            
-            # Update if this is the most filled bubble
-            if fill > max_fill and fill > (bubble_w * bubble_h * 0.3):  # 30% threshold
-                max_fill = fill
-                marked = a + 1
-        
-        answers[q + 1] = marked
-    
-    return answers
+    return normalized
 
-def process_answer_sheet(image_path):
-    # Read and preprocess the image
-    img = preprocess_image(image_path)
+def find_bubble_positions(bubble_area):
+    """Find actual bubble positions using contour detection"""
+    _, thresh = cv2.threshold(bubble_area, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Find the page corners
-    corners = find_page_corners(img)
+    if not contours:
+        # Fallback to equal division
+        height = bubble_area.shape[0]
+        bubble_height = height // 4
+        return [(0, i * bubble_height, bubble_area.shape[1], 
+                (i + 1) * bubble_height if i < 3 else height) for i in range(4)]
     
-    # Apply perspective transform to get a top-down view of the page
-    warped = four_point_transform(img, corners)
+    # Filter contours by area and aspect ratio
+    bubble_contours = []
+    min_area = 100
+    max_area = bubble_area.shape[0] * bubble_area.shape[1] // 6
     
-    # Create a directory for sections if it doesn't exist
-    sections_dir = "sections"
-    if not os.path.exists(sections_dir):
-        os.makedirs(sections_dir)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if min_area < area < max_area:
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h if h > 0 else 0
+            if 0.3 < aspect_ratio < 3.0:
+                bubble_contours.append((x, y, w, h, area))
     
-    # Define the exact coordinates for each section
-    sections = [
-        {"name": "section_1", "coords": (344, 608, 1861, 896)},
-        {"name": "section_2", "coords": (356, 972, 1855, 1232)},
-        {"name": "section_3", "coords": (341, 1311, 1855, 1562)},
-        {"name": "section_4", "coords": (334, 1661, 1848, 1921)},
-        {"name": "section_5", "coords": (337, 2017, 1848, 2278)},
-        {"name": "section_6", "coords": (1904, 1318, 3403, 1568)},
-        {"name": "section_7", "coords": (1889, 1664, 3427, 1931)},
-        {"name": "section_8", "coords": (1901, 2022, 3393, 2282)}
-    ]
+    # Sort by y-coordinate and take top 4
+    bubble_contours.sort(key=lambda b: b[1])
+    if len(bubble_contours) > 4:
+        bubble_contours = sorted(bubble_contours, key=lambda b: b[4], reverse=True)[:4]
+        bubble_contours.sort(key=lambda b: b[1])
     
-    # Dictionary to store all answers
-    all_answers = {}
+    if len(bubble_contours) < 4:
+        # Fallback to equal division
+        height = bubble_area.shape[0]
+        bubble_height = height // 4
+        return [(0, i * bubble_height, bubble_area.shape[1], 
+                (i + 1) * bubble_height if i < 3 else height) for i in range(4)]
     
-    # Process each section
-    for section in sections:
-        x1, y1, x2, y2 = section["coords"]
-        # Crop the section
-        section_img = warped[y1:y2, x1:x2]
+    return [(x, y, x + w, y + h) for x, y, w, h, _ in bubble_contours[:4]]
+
+def detect_marked_bubble(column_img, save_debug=False, debug_dir=None, question_num=None, section_num=None):
+    """Detect which bubble (1-4) is marked, return 0 if none"""
+    gray = cv2.cvtColor(column_img, cv2.COLOR_BGR2GRAY) if len(column_img.shape) == 3 else column_img
+    height = gray.shape[0]
+    
+    # Remove question number bar
+    question_bar_height = int(height * QUESTION_BAR_RATIO)
+    bubble_area = gray[question_bar_height:, :]
+    bubble_area_color = column_img[question_bar_height:, :]
+    
+    # Find bubble positions and apply threshold
+    bubble_positions = find_bubble_positions(bubble_area)
+    _, thresh = cv2.threshold(bubble_area, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    bubble_scores = []  # Store all bubble scores
+    
+    for bubble_num, (x1, y1, x2, y2) in enumerate(bubble_positions, 1):
+        bubble_region = thresh[y1:y2, x1:x2]
         
-        # Save the section
-        section_path = os.path.join(sections_dir, f"{section['name']}.jpg")
-        cv2.imwrite(section_path, section_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+        # Calculate white percentage (unfilled area)
+        total_pixels = bubble_region.size
+        white_pixels = np.sum(bubble_region == 0)  # Count white pixels (value 0 in inverted image)
+        black_pixels = np.sum(bubble_region == 255)  # Count black pixels (filled areas)
         
-        # Detect answers in this section
-        section_answers = detect_answers(section_img)
-        all_answers[section['name']] = section_answers
+        white_ratio = white_pixels / total_pixels if total_pixels > 0 else 1.0
+        black_ratio = black_pixels / total_pixels if total_pixels > 0 else 0.0
+        
+        # A filled bubble should have LOW white percentage (most of bubble area is filled)
+        # An empty bubble should have HIGH white percentage (most of bubble area is empty)
+        fill_score = 1.0 - white_ratio  # Convert to fill score (higher = more filled)
+        
+        # Additional check: make sure we have significant black pixels (actual marks)
+        # This helps distinguish between filled bubbles and noise
+        if black_ratio < 0.1:  # Less than 10% black pixels = likely empty
+            fill_score = 0.0
+        
+        bubble_scores.append((bubble_num, fill_score))
+        
+        # Save debug images if requested
+        if save_debug and debug_dir and question_num and section_num:
+            bubble_color = bubble_area_color[y1:y2, x1:x2]
+            bubble_file = os.path.join(debug_dir, f"s{section_num}_q{question_num:02d}_bubble_{bubble_num}_fill_{fill_score:.3f}.jpg")
+            thresh_file = os.path.join(debug_dir, f"s{section_num}_q{question_num:02d}_bubble_{bubble_num}_thresh_w{white_ratio:.3f}_b{black_ratio:.3f}.jpg")
+            cv2.imwrite(bubble_file, bubble_color, [cv2.IMWRITE_JPEG_QUALITY, 100])
+            cv2.imwrite(thresh_file, bubble_region, [cv2.IMWRITE_JPEG_QUALITY, 100])
     
-    # Save the full cropped page
+    # Find the bubble with highest fill score
+    bubble_scores.sort(key=lambda x: x[1], reverse=True)  # Sort by fill score, highest first
+    best_bubble, best_score = bubble_scores[0]
+    
+    # Only select a bubble if it's significantly filled (above threshold)
+    if best_score > BUBBLE_THRESHOLD:
+        marked_bubble = best_bubble
+    else:
+        marked_bubble = 0  # No bubble is sufficiently filled
+    
+    return marked_bubble
+
+def process_section(warped_img, section_num, sections_dir, save_debug=False):
+    """Process a single section: normalize, extract columns, detect bubbles"""
+    x1, y1, x2, y2 = SECTIONS[section_num]
+    
+    # Extract and normalize section
+    raw_section = warped_img[y1:y2, x1:x2]
+    normalized_section = normalize_section(raw_section)
+    
+    # Save section
+    section_path = os.path.join(sections_dir, f"section_{section_num}.jpg")
+    cv2.imwrite(section_path, normalized_section, [cv2.IMWRITE_JPEG_QUALITY, 100])
+    
+    # Create directories
+    columns_dir = os.path.join(sections_dir, f"section_{section_num}_columns")
+    os.makedirs(columns_dir, exist_ok=True)
+    
+    debug_dir = None
+    if save_debug:
+        debug_dir = os.path.join(sections_dir, f"section_{section_num}_bubbles_analysis")
+        os.makedirs(debug_dir, exist_ok=True)
+    
+    # Process columns
+    height, width = normalized_section.shape[:2]
+    column_width = width // 30
+    section_answers = {}
+    
+    for col in range(30):
+        # Calculate column boundaries
+        x1_col = col * column_width
+        x2_col = x1_col + column_width if col < 29 else width
+        x2_col = min(x2_col, width)
+        
+        # Extract column
+        column_img = normalized_section[:, x1_col:x2_col]
+        question_num = col + 1
+        
+        # Detect marked bubble
+        marked_bubble = detect_marked_bubble(
+            column_img, save_debug, debug_dir, question_num, section_num
+        )
+        section_answers[question_num] = marked_bubble
+        
+        # Save column
+        column_path = os.path.join(columns_dir, f"column_{question_num:02d}.jpg")
+        cv2.imwrite(column_path, column_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+    
+    return section_path, section_answers
+
+def process_answer_sheet(image_path, save_debug=False):
+    """Main processing function"""
+    # Load and crop paper
+    warped = load_and_crop_paper(image_path)
+    
+    # Save full cropped page
     cv2.imwrite("cropped_page.jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 100])
     
-    return all_answers
-
-# Example usage:
-if __name__ == "__main__":
-    result = process_answer_sheet(r"C:\Users\liorz\OneDrive\Desktop\PSY\answersheet.jpg")
-    print("Page has been cropped and saved as 'cropped_page.jpg'")
-    print("Sections have been saved in the 'sections' directory")
-    print("\nDetected answers:")
-    for section_name, answers in result.items():
-        print(f"\n{section_name}:")
-        for question, answer in answers.items():
-            print(f"Question {question}: {answer}")
+    # Create sections directory
+    sections_dir = "sections"
+    os.makedirs(sections_dir, exist_ok=True)
     
+    # Process all sections
+    all_answers = {}
+    extracted_files = []
+    
+    for section_num in range(1, 9):
+        print(f"Processing section {section_num}...")
+        section_path, section_answers = process_section(warped, section_num, sections_dir, save_debug)
+        extracted_files.append(section_path)
+        all_answers[f"section_{section_num}"] = section_answers
+        
+        # Show sample answers
+        sample_answers = dict(list(section_answers.items())[:5])
+        print(f"  Sample answers: {sample_answers}...")
+    
+    return extracted_files, all_answers
+
+def main():
+    """Main execution function"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Get image path
+    if len(sys.argv) > 1:
+        image_path = sys.argv[1]
+    else:
+        image_path = os.path.join(script_dir, "answersheet.jpg")
+    
+    if not os.path.exists(image_path):
+        print(f"Error: Image file '{image_path}' not found.")
+        print("Usage: python psy.py [path_to_image]")
+        sys.exit(1)
+    
+    try:
+        # Process with debug images enabled
+        extracted_files, all_answers = process_answer_sheet(image_path, save_debug=True)
+        
+        # Print summary
+        print(f"\n=== SUMMARY ===")
+        print(f"Successfully processed {len(extracted_files)} sections")
+        print(f"Extracted 240 bubble columns total (8 sections × 30 questions)")
+        print(f"Saved bubble analysis images in section_X_bubbles_analysis/ directories")
+        
+        # Print detected answers
+        print(f"\n=== DETECTED ANSWERS ===")
+        for section_name, answers in all_answers.items():
+            print(f"\n{section_name.upper()}:")
+            for i in range(0, 30, 10):
+                group = {k: v for k, v in answers.items() if i < k <= i + 10}
+                print(f"  Questions {i+1}-{i+10}: {group}")
+        
+        # Save answers to JSON
+        with open("detected_answers.json", "w") as f:
+            json.dump(all_answers, f, indent=2)
+        print(f"\nAnswers saved to: detected_answers.json")
+        
+    except Exception as e:
+        print(f"Error processing image: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
